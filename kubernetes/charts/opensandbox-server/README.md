@@ -4,7 +4,7 @@ OpenSandbox Lifecycle API server: provides sandbox create/delete and other lifec
 
 ## Prerequisites
 
-- Kubernetes 1.20.0+
+- Kubernetes 1.21.1+
 - Helm 3.0+
 - OpenSandbox CRDs installed (deploy opensandbox-controller first)
 

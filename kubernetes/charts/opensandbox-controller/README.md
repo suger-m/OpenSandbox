@@ -13,7 +13,7 @@ This chart bootstraps an OpenSandbox Controller deployment on a Kubernetes clust
 
 ## Prerequisites
 
-- Kubernetes 1.20.0+
+- Kubernetes 1.21.1+
 - Helm 3.0+
 - Container runtime (Docker, containerd, etc.)
 

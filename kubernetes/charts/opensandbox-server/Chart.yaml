@@ -38,7 +38,7 @@ maintainers:
     email: opensandbox@example.com
 
 # Kubernetes version constraints
-kubeVersion: ">=1.20.0-0"
+kubeVersion: ">=1.21.1-0"
 
 annotations:
   artifacthub.io/category: integration-delivery
