@@ -250,7 +250,11 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	cmd.Env = mergeEnvs(os.Environ(), extraEnv)
 
 	// use DevNull as stdin so interactive programs exit immediately.
-	cmd.Stdin = os.NewFile(uintptr(syscall.Stdin), os.DevNull)
+	devNull, err := os.Open(os.DevNull)
+	if err == nil {
+		cmd.Stdin = devNull
+		defer devNull.Close()
+	}
 
 	err = cmd.Start()
 	kernel := &commandKernel{
