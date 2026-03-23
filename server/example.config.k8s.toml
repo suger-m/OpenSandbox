@@ -28,6 +28,15 @@ port = 8080
 log_level = "INFO"
 # api_key = "your-secret-api-key"  # Optional: Uncomment to enable API key authentication
 
+# 🧪 [EXPERIMENTAL] Renew-on-access. Off by default — see server/README.md.
+[renew_intent]
+enabled = false
+min_interval_seconds = 60
+redis.enabled = false
+# redis.dsn = "redis://127.0.0.1:6379/0"
+redis.queue_key = "opensandbox:renew:intent"
+redis.consumer_concurrency = 8
+
 [runtime]
 type = "kubernetes"
 execd_image = "opensandbox/execd:v1.0.7"

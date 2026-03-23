@@ -24,6 +24,15 @@ port = 8080
 log_level = "INFO"
 # api_key = "your-secret-api-key"  # Optional: Uncomment to enable API key authentication
 
+# 🧪 [EXPERIMENTAL] 按访问续期（OSEP-0009）。默认关闭 — 说明见 server/README_zh.md。
+[renew_intent]
+enabled = false
+min_interval_seconds = 60
+redis.enabled = false
+# redis.dsn = "redis://127.0.0.1:6379/0"
+redis.queue_key = "opensandbox:renew:intent"
+redis.consumer_concurrency = 8
+
 [runtime]
 # Runtime selection (docker | kubernetes)
 # -----------------------------------------------------------------

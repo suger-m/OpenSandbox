@@ -17,9 +17,12 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import types
 from pathlib import Path
+from typing import Any, FrozenSet, Union, get_args, get_origin
 
 import uvicorn
+from pydantic import BaseModel
 
 from src.config import (
     AgentSandboxRuntimeConfig,
@@ -29,10 +32,29 @@ from src.config import (
     EgressConfig,
     IngressConfig,
     KubernetesRuntimeConfig,
+    RenewIntentConfig,
     RuntimeConfig,
     ServerConfig,
     StorageConfig,
 )
+
+
+def _strip_optional(annotation: Any) -> Any:
+    """Unwrap Optional / Union[..., None] to the inner type."""
+    if annotation is None:
+        return None
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is Union or origin is types.UnionType:
+        filtered = [a for a in args if a is not type(None)]
+        if len(filtered) == 1:
+            return filtered[0]
+    return annotation
+
+
+def _is_basemodel_type(annotation: Any) -> bool:
+    inner = _strip_optional(annotation)
+    return isinstance(inner, type) and issubclass(inner, BaseModel)
 
 EXAMPLE_FILE_MAP = {
     "docker": "example.config.toml",
@@ -139,6 +161,7 @@ def render_full_config(destination: str | Path | None = None, *, force: bool = F
         *,
         placeholders: dict[str, str] | None = None,
         extra_comments: list[str] | None = None,
+        dotted_nested: FrozenSet[str] | None = None,
     ) -> str:
         lines: list[str] = []
         if extra_comments:
@@ -146,14 +169,51 @@ def render_full_config(destination: str | Path | None = None, *, force: bool = F
         lines.append(f"[{section}]")
 
         placeholders = placeholders or {}
+        dotted_nested = dotted_nested or frozenset()
 
         for field_name, field in model.model_fields.items():
+            if _is_basemodel_type(field.annotation):
+                continue
             key = field.alias or field_name
             value = placeholders.get(key, _placeholder_for_field(field))
             if field.description:
                 lines.append(f"# {field.description}")
             lines.append(f"{key} = {value}")
             lines.append("")
+
+        for field_name, field in model.model_fields.items():
+            if field_name not in dotted_nested or not _is_basemodel_type(field.annotation):
+                continue
+            inner = _strip_optional(field.annotation)
+            if not isinstance(inner, type) or not issubclass(inner, BaseModel):
+                continue
+            for sub_name, sub_field in inner.model_fields.items():
+                sub_key = f"{field_name}.{sub_name}"
+                value = placeholders.get(sub_key, _placeholder_for_field(sub_field))
+                if sub_field.description:
+                    lines.append(f"# {sub_field.description}")
+                lines.append(f"{sub_key} = {value}")
+                lines.append("")
+
+        nested_blocks: list[str] = []
+        for field_name, field in model.model_fields.items():
+            if not _is_basemodel_type(field.annotation):
+                continue
+            if field_name in dotted_nested:
+                continue
+            inner = _strip_optional(field.annotation)
+            if not isinstance(inner, type) or not issubclass(inner, BaseModel):
+                continue
+            nested_path = f"{section}.{field_name}"
+            nested_blocks.append(
+                _render_section(nested_path, inner, placeholders=None, extra_comments=None)
+            )
+
+        if nested_blocks:
+            if lines and lines[-1] == "":
+                lines.pop()
+            lines.append("")
+            lines.extend(nested_blocks)
 
         if lines and lines[-1] == "":
             lines.pop()
@@ -167,6 +227,15 @@ def render_full_config(destination: str | Path | None = None, *, force: bool = F
     sections = [
         "# Generated from OpenSandbox config schema. Remove sections you do not use.",
         _render_section("server", ServerConfig),
+        _render_section(
+            "renew_intent",
+            RenewIntentConfig,
+            extra_comments=[
+                "Renew-intent: top-level section (not under [server]). "
+                "Redis options use dotted keys in this table (redis.enabled, redis.queue_key, …)."
+            ],
+            dotted_nested=frozenset({"redis"}),
+        ),
         _render_section("runtime", RuntimeConfig),
         _render_section("docker", DockerConfig),
         _render_section(
