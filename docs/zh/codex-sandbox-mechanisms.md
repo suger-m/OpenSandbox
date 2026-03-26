@@ -1,74 +1,257 @@
-# Codex 沙箱机制横向对照
+# Codex Sandbox 机制横向对照
 
-这篇文档只回答三个问题：每个机制做什么、它不做什么、它在 Codex 源码里出现在哪里。
+这篇文档不按“先看哪个源码文件”来组织，而是按“沙箱常见机制到底是什么”来组织。
+如果你对进程、权限、ACL、token、namespace 这些基础名词还不稳，建议先读 [Codex Sandbox 技术基础入门](./codex-sandbox-foundations.md)。
+如果你还没建立整体心智模型，建议先读 [Codex Sandbox 总览](./codex-sandbox-overview.md)。
+如果你还缺少运行时基础，建议再补一遍 [基础预备：从零看懂 Docker、系统知识与 Kubernetes](./runtime-primer-for-reading-source.md)。
 
-如果你是第一次读这类代码，可以先记住一句话：`protocol/src/protocol.rs` 定义的是“沙箱想要什么”，而各平台文件定义的是“操作系统实际怎么拦住它”。
+读完这篇以后，适合继续下钻到平台篇：
 
-## 先看总图
+- [Codex 在 macOS 上如何使用 Seatbelt](./codex-sandbox-macos.md)
+- [Codex 的 Linux sandbox 管线](./codex-sandbox-linux.md)
+- [Codex 原生 Windows 沙箱入门](./codex-sandbox-windows.md)
 
-- macOS 主要靠 Seatbelt。
-- Linux 默认靠 bubblewrap + `no_new_privs` + seccomp，Landlock 只保留为旧路径。
-- Windows 主要靠 restricted token，再配合 ACL、firewall、desktop 和 setup orchestrator。
+## 先记一个总原则
 
-## 1. 文件系统隔离
+“机制”不是“策略”。
 
-| 平台 | 它做什么 | 它不做什么 | 源码位置 |
-|---|---|---|---|
-| macOS | `seatbelt.rs` 把 `SandboxPolicy` 翻译成 Seatbelt 的 SBPL 规则，按显式可读根、可写根和平台默认根来拼文件访问边界。 | 它不会把进程变成容器，也不会改变宿主文件的所有权；它只是限制这个进程能读写什么。 | [`protocol/src/protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs) / [`sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs) |
-| Linux | `bwrap.rs` 默认把文件系统变成只读视图，再把 writable roots 叠上去；`linux_run_main.rs` 决定何时走 bubblewrap，何时走旧的 Landlock 兼容路径。 | 它不替代宿主的磁盘权限模型，也不负责包级别或端口级别的网络控制。 | [`linux-sandbox/src/bwrap.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/bwrap.rs) / [`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) |
-| Windows | `acl.rs` 通过 DACL/ACE 给目录加允许或拒绝规则；`setup_orchestrator.rs` 负责把这些规则刷新到正确的用户和工作区。 | 它不是挂载隔离，也不会把整个文件树“藏起来”；更像是对目录权限做精细重写。 | [`windows-sandbox-rs/src/acl.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/acl.rs) / [`windows-sandbox-rs/src/setup_orchestrator.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/setup_orchestrator.rs) |
+- 策略回答：我要什么边界。
+- 机制回答：操作系统靠什么把边界变成现实。
 
-## 2. 进程与权限控制
+同样一句“工作区可写、其他只读、网络尽量关掉”，在三个平台上可能分别变成：
 
-| 平台 | 它做什么 | 它不做什么 | 源码位置 |
-|---|---|---|---|
-| macOS | Seatbelt 直接限制进程可访问的资源范围，和文件、网络规则一起生效。 | 它不会像 Linux 那样显式创建用户命名空间，也不会像 Windows 那样给进程换一张新的 restricted token。 | [`sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs) |
-| Linux | `linux_run_main.rs` 先让 bubblewrap 建好隔离环境，再在进程内应用 `PR_SET_NO_NEW_PRIVS` 和 seccomp；这样后面的子进程继承的是更小权限。 | 它不是一个“系统级容器管理器”；它只控制这条命令链，没打算改造整个机器的进程模型。 | [`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) / [`linux-sandbox/src/landlock.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/landlock.rs) |
-| Windows | `token.rs` 用 `CreateRestrictedToken` 创建受限 token，再配合默认 DACL 和 capability SID 压低权限。 | 它不是“把管理员变成普通用户”的通用 Windows 登录切换；它只是让这个 sandbox 进程拿到更小的权限集合。 | [`windows-sandbox-rs/src/token.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/token.rs) |
+- 一份 policy 文本
+- 一组 namespace 和 mount 操作
+- 一张受限 token 加上 ACL 和 firewall 规则
 
-## 3. 网络限制
+所以横向比较时，最稳的办法不是比较文件名，而是比较这些机制各自负责什么。
 
-| 平台 | 它做什么 | 它不做什么 | 源码位置 |
-|---|---|---|---|
-| macOS | `seatbelt.rs` 会把网络规则编进 Seatbelt policy；在代理或受管网络场景下，它会把可用网络收窄到 localhost、unix socket 和明确允许的端口。 | 它不是通用防火墙，也不负责 packet 级过滤；它更像“按策略放行 socket 访问”。 | [`sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs) |
-| Linux | `linux_run_main.rs` 会在受限网络场景里安装 seccomp，并在需要时切到 proxy-only 或 isolated 网络命名空间；`bwrap.rs` 负责把这些模式塞进 bubblewrap 参数里。 | 它不是 iptables 之类的流量防火墙，也不试图解析请求内容；它主要拦的是系统调用和命名空间可见性。 | [`linux-sandbox/src/bwrap.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/bwrap.rs) / [`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) |
-| Windows | `firewall.rs` 用 Windows Firewall 写出非回环流量阻断规则，并给代理端口留白名单；`setup_orchestrator.rs` 会根据离线/在线身份和代理端口刷新这些规则。 | 它不限制进程的文件权限，也不替代 restricted token；它只处理网络出口。 | [`windows-sandbox-rs/src/firewall.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/firewall.rs) / [`windows-sandbox-rs/src/setup_orchestrator.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/setup_orchestrator.rs) |
+## 1. 文件系统边界
 
-## 4. 身份边界
+文件系统边界回答的是：这个进程能看见哪些路径，哪些路径能写，哪些路径虽然位于可写根下但仍要例外保护。
 
-这里的“身份边界”是指：系统有没有把 sandbox 进程当成一个“更小、更专门的身份”来对待。
+### macOS：策略式路径匹配
 
-| 平台 | 它做什么 | 它不做什么 | 源码位置 |
-|---|---|---|---|
-| macOS | Codex 在这条路径里没有单独切换到另一个用户身份；它仍然是在当前 macOS 用户上下文里，用 Seatbelt 限制资源访问。 | 它不创建新的用户登录，也不做类似 Windows logon SID 那种身份重建。 | [`protocol/src/protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs) / [`sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs) |
-| Linux | `--unshare-user` 会让 bubblewrap 进入新的 user namespace，再配合 `--unshare-pid`、`--unshare-net` 把沙箱看见的世界缩小。 | 它不等于“创建了一个真实的 Linux 账号”；更准确地说，是 namespace 层面的身份隔离。 | [`linux-sandbox/src/bwrap.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/bwrap.rs) / [`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) |
-| Windows | 这是 Windows 里最明确的身份边界：restricted token + capability SID + logon SID，把“谁能做什么”收紧到沙箱需要的最小集合。 | 它不等于整个桌面会话都换了身份；桌面、ACL、firewall 仍然是另外几层。 | [`windows-sandbox-rs/src/token.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/token.rs) / [`windows-sandbox-rs/src/setup_orchestrator.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/setup_orchestrator.rs) |
+macOS 这一路最像“把路径规则编译成安全策略”。Codex 会把可读根、可写根、排除子路径、Unix socket 和平台默认根拼成 Seatbelt 能理解的规则文本，再交给 `sandbox-exec`。
 
-## 5. UI / 桌面边界
+这种机制的特点是：
 
-| 平台 | 它做什么 | 它不做什么 | 源码位置 |
-|---|---|---|---|
-| macOS | 这条 Codex 沙箱路径里没有单独的桌面隔离层。 | 它不会把 GUI 和终端任务拆成两个桌面世界。 | [`protocol/src/protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs) |
-| Linux | 这条路径里也没有独立的 UI 沙箱层，重点还是文件、进程、网络。 | 它不会创建独立桌面，也不会把窗口系统当作一等边界来管理。 | [`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) |
-| Windows | `desktop.rs` 可以创建 private desktop，并且 `process.rs` 会把 `lpDesktop` 显式指过去；`core/src/windows_sandbox.rs` 还把 `sandbox_private_desktop` 作为可配置项。 | 它只隔离桌面会话表层，不会自动替你做文件或网络限制。 | [`windows-sandbox-rs/src/desktop.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/desktop.rs) / [`windows-sandbox-rs/src/process.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/process.rs) / [`core/src/windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs) |
+- 优点是规则表达很直接，路径白名单和例外规则都比较清楚。
+- 边界是“按策略允许什么路径访问”，不是“重建一个新的文件系统视图”。
+- 它不会像容器那样把宿主目录重新挂载成另一个世界。
 
-## 6. 旧路径与回退
+### Linux：挂载视图重建
 
-| 平台 | 它做什么 | 它不做什么 | 源码位置 |
-|---|---|---|---|
-| macOS | Seatbelt 仍保留一些兼容性读权限拼接逻辑，让老工作流继续拿到必要的系统读取能力。 | 它不是另一套沙箱引擎，也不是“旧版和新版并行运行”的双实现。 | [`sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs) |
-| Linux | `linux_run_main.rs` 里有 `--use-legacy-landlock` 旧路径；`landlock.rs` 也明确把 Landlock 标成 legacy/backup。bubblewrap 还有 `--proc /proc` 的预检回退，容器不允许时会改走 `--no-proc`。 | 旧 Landlock 不是完整替代品，尤其不支持受限 read-only 这类更细的文件策略。 | [`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) / [`linux-sandbox/src/landlock.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/landlock.rs) / [`linux-sandbox/src/bwrap.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/bwrap.rs) |
-| Windows | `core/src/windows_sandbox.rs` 还能读老 feature key，并把它们翻译成当前的 `Elevated` / `RestrictedToken` 级别；`setup_orchestrator.rs` 还有 refresh-only 路径，尽量避免不必要的 UAC 弹窗。 | 它不意味着回到“旧版安全模型”；这些更多是迁移和初始化兼容层。 | [`core/src/windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs) / [`windows-sandbox-rs/src/setup_orchestrator.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/setup_orchestrator.rs) / [`windows-sandbox-rs/src/lib.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/lib.rs) |
+Linux 更像“先造一个新的运行时视图”。Codex 通过 bubblewrap 组合 `ro-bind`、`bind`、`tmpfs`、`/dev`、`/proc` 等挂载动作，让进程从一开始就活在一个被改造过的文件系统里。
 
-## 读源码顺序
+这种机制的特点是：
 
-如果你想顺着源码把整条链路看懂，可以按这个顺序读：
+- 优点是边界非常直观：进程看到的世界本身就被重排过了。
+- 很适合表达“默认只读，再把少数目录补成可写”。
+- 例外保护也自然，比如工作区可写，但 `.git`、`.codex` 这类子目录再盖回只读。
 
-1. 先看 [`protocol/src/protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs)，把 `SandboxPolicy`、`ReadOnlyAccess`、`NetworkAccess` 先记住。
-2. 再看 macOS 的 [`sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs)。
-3. 再看 Linux 的 [`linux-sandbox/src/bwrap.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/bwrap.rs)、[`linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs) 和 [`linux-sandbox/src/landlock.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/landlock.rs)。
-4. 最后看 Windows 的 [`core/src/windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs)，再往下跳到 [`windows-sandbox-rs/src/token.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/token.rs)、[`windows-sandbox-rs/src/acl.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/acl.rs)、[`windows-sandbox-rs/src/firewall.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/firewall.rs)、[`windows-sandbox-rs/src/desktop.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/desktop.rs) 和 [`windows-sandbox-rs/src/setup_orchestrator.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/setup_orchestrator.rs)。
+### Windows：ACL 权限重写
 
-## 一句提醒
+Windows 没有沿着“重新挂载文件树”的路走，而是更强调“谁对哪个目录拥有什么访问权限”。Codex 会围绕 DACL/ACE 去检查、补写、收紧目录权限，让受限身份只能在该写的地方写。
 
-Codex 不是用“一种沙箱”解决所有平台问题，而是先抽象出统一政策，再按平台把它翻译成最合适的 OS 机制。你读这篇文档的目标，不是背机制名字，而是知道每个机制的边界在哪里。
+这种机制的特点是：
+
+- 优点是更贴合 Windows 原生权限模型。
+- 它不是把目录“藏起来”，而是让受限身份即使看得到，也拿不到不该有的写权限。
+- 重点不在 mount，而在 access control。
+
+### 一句话对照
+
+| 平台 | 文件系统机制的直觉 |
+| --- | --- |
+| macOS | 写规则 |
+| Linux | 搭视图 |
+| Windows | 改权限 |
+
+源码佐证：
+
+- [`seatbelt.rs` 的访问策略构造](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L305-L485)
+- [`bwrap.rs` 的文件系统参数生成](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/bwrap.rs#L41-L385)
+- [`acl.rs` 的 DACL 检查与重写路径](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/acl.rs#L54-L621)
+
+## 2. 进程权限边界
+
+这一层回答的是：即使进程启动了，它是不是还可能在运行过程中重新拿到更高权限，或者继承到过宽的宿主能力。
+
+### macOS：主要靠 Seatbelt 约束资源访问
+
+在 Codex 的 macOS 路径里，重点不在“切一个新的用户身份”，而在“让当前进程在 Seatbelt 规则下运行”。它仍然主要依赖资源访问限制，而不是单独重建身份模型。
+
+这意味着：
+
+- 它对“能碰什么资源”限制很强。
+- 但它不是 Linux user namespace，也不是 Windows restricted token 那种显式身份收缩路线。
+
+### Linux：namespace + `no_new_privs`
+
+Linux 这里有更明显的“进程边界工程”。bubblewrap 可以把进程放进新的 user/pid/net namespace，而 `PR_SET_NO_NEW_PRIVS` 则负责堵住“之后再借 setuid 或类似路径提权”的可能。
+
+这层机制的教学重点是：
+
+- namespace 解决“你看见的是哪个世界”。
+- `no_new_privs` 解决“你之后还能不能把权限再变大”。
+
+它们经常一起出现，但职责并不相同。
+
+### Windows：restricted token
+
+Windows 最典型的做法是给沙箱进程发一张“更小的身份证”。`CreateRestrictedToken` 会把权限集合压缩，再配合 capability SID、logon SID 和默认 DACL，让“这个进程是谁、能做什么”从身份层就先收紧。
+
+这一层的直觉是：
+
+- Linux 更像在改“世界”和“规则”。
+- Windows 更像先改“你是谁”。
+
+源码佐证：
+
+- [`spawn.rs` 的启动约束与 stdio/network 标记](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L50-L124)
+- [`linux_run_main.rs` 与 `landlock.rs` 中的 inner-stage 和 `no_new_privs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L119-L206)
+- [`token.rs` 中的 `CreateRestrictedToken` 路径](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/token.rs#L308-L369)
+
+## 3. 系统调用和网络出口
+
+很多人第一次看 sandbox 时，会把“网络限制”理解成单一的开/关。真实情况通常更细：
+
+- 你是不是还能建 socket
+- 你能不能绑定本地端口
+- 你是不是只能连 loopback
+- 你是不是只能通过代理桥接出网
+
+### macOS：把网络规则写进 Seatbelt
+
+macOS 路径下，网络通常和文件访问一起写进 Seatbelt policy。它擅长表达“允许本地回环”“允许特定 Unix socket”“允许某些代理路径”这类规则。
+
+这意味着它更像：
+
+- 对 socket 访问做策略放行
+- 而不是单独构建网络命名空间
+
+### Linux：网络命名空间 + seccomp
+
+Linux 这里是两层组合：
+
+1. bubblewrap 决定网络命名空间是 `FullAccess`、`Isolated` 还是 `ProxyOnly`
+2. seccomp 再决定某些网络相关 syscall 能不能继续用
+
+这套组合很值得学，因为它展示了一个通用设计：
+
+- 一层控制“你看见哪个网络”
+- 一层控制“你能不能调用危险接口”
+
+两层叠起来，比单独依赖任一层都更稳。
+
+### Windows：firewall 规则补齐出口限制
+
+Windows 这边没有 Linux 那样的 net namespace，于是 Codex 采用的是另一条思路：在受限身份之外，再额外写 Windows Firewall 规则，把非 loopback 出口或不符合代理要求的流量继续收紧。
+
+它的特点是：
+
+- 处理的是网络出口和授权范围
+- 不负责文件权限
+- 也不替代 restricted token
+
+源码佐证：
+
+- [`seatbelt.rs` 中的 `allow_local_binding`、Unix socket 和网络策略拼接](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L80-L290)
+- [`linux_run_main.rs` 的网络模式与 proc fallback 主线](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L141-L206)
+- [`landlock.rs` 的网络 seccomp 模式](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/landlock.rs#L91-L184)
+- [`firewall.rs` 的 `LocalUserAuthorizedList` 和规则配置路径](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/firewall.rs#L267-L350)
+
+## 4. 身份与会话边界
+
+这层机制回答的是：系统是否把沙箱进程当成一个更小、更专门的主体来对待，以及它有没有单独的会话或桌面边界。
+
+### macOS：以资源限制为主，不强调身份重建
+
+Codex 的 macOS 路径并不突出“新身份”，更突出“当前身份下的资源访问被 Seatbelt 收紧”。所以它的核心不是身份切换。
+
+### Linux：更多是 namespace 身份感，而不是真新用户
+
+Linux 的 user namespace 很容易被误读成“创建了一个新的系统用户”。更准确的说法是：它提供的是 namespace 语义上的隔离感，而不是传统账户体系里的新登录身份。
+
+### Windows：身份边界最显式
+
+Windows 在这方面最“制度化”。受限 token、capability SID、logon SID 让沙箱身份变成系统显式可辨认的一层。再往上，private desktop 还能把 GUI/交互会话和普通桌面继续分开。
+
+这也是为什么 Windows 文档常常会同时提到 token、ACL、desktop。它们不是重复，而是在分别回答：
+
+- 你是谁
+- 你能碰哪些对象
+- 你在哪个桌面上下文里运行
+
+源码佐证：
+
+- [`windows_sandbox.rs` 中的 private desktop 配置解析](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L78-L86)
+- [`desktop.rs` 的 `LaunchDesktop` 路径](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/desktop.rs#L57-L166)
+- [`process.rs` 在平台篇中继续承接桌面与受限 token 的执行路径`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/process.rs)
+
+## 5. 兼容层与回退路径
+
+成熟沙箱实现很少是“一条理想路径跑到底”。真实工程里，经常还要处理兼容、迁移和失败回退。
+
+### macOS：平台默认根和 Unix socket 白名单
+
+macOS 这边的兼容性主要体现在策略拼接细节上。比如系统默认只读根、代理所需的本地 socket、是否允许本地绑定，都会影响最终 policy 长什么样。
+
+它更像“规则生成时的兼容补丁”，而不是另一套独立后端。
+
+### Linux：`/proc` fallback 与 legacy Landlock
+
+Linux 是三平台里兼容路径最显眼的一个：
+
+- bubblewrap 尝试挂 `/proc` 失败时，会退回 `--no-proc`
+- 仍保留 `--use-legacy-landlock`
+- 但 Landlock 明确已经不是当前主路径，而且某些更细的只读策略并不支持
+
+这很适合拿来理解一个工程现实：
+
+> 主路径是主路径，保底路径是保底路径；两者同时存在，不代表它们地位相同。
+
+### Windows：setup 持久化与 refresh-only
+
+Windows 这边的复杂性主要来自“不是每次都重新做一遍完整 setup”。Codex 会解析当前 level、检查 setup 是否完成、必要时重新 setup，并把结果持久化。某些变化只需要 refresh，不一定要每次都走最重的初始化链路。
+
+这说明 Windows 路径里有明显的“长期状态”概念，而不仅仅是一次性启动参数。
+
+源码佐证：
+
+- [`linux_run_main.rs` 的 `run_bwrap_with_proc_fallback`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L401-L706)
+- [`landlock.rs` 对 legacy backend 能力边界的说明](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/landlock.rs#L1-L73)
+- [`windows_sandbox.rs` 的 setup 解析与持久化主线](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L287-L444)
+- [`setup_orchestrator.rs` 中对 firewall drift 和 marker 的处理](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/windows-sandbox-rs/src/setup_orchestrator.rs)
+
+## 6. 把三平台压缩成一张比较表
+
+如果你只想留一张记忆卡，可以看这张：
+
+| 维度 | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| 文件系统 | Seatbelt 路径规则 | bubblewrap 挂载视图 | ACL/DACL 权限重写 |
+| 进程权限 | 资源访问受 Seatbelt 控制 | namespace + `no_new_privs` | restricted token |
+| 网络 | Seatbelt socket/loopback/Unix socket 规则 | net namespace + seccomp | firewall 规则补齐出口限制 |
+| 身份模型 | 不强调重建新身份 | namespace 语义上的隔离身份 | SID/token 最显式 |
+| 会话/桌面 | 无单独桌面层 | 无单独桌面层 | private desktop 可选 |
+| 兼容/回退 | 规则拼接兼容 | `/proc` fallback + legacy Landlock | setup 持久化与 refresh |
+
+## 7. 读平台篇时该带着什么问题去看
+
+到了平台篇，建议每次只带一个问题：
+
+- 看 macOS 篇时，重点问：Seatbelt rule 是怎样从 policy 拼出来的？
+- 看 Linux 篇时，重点问：bubblewrap 和 seccomp 分别负责哪一半？
+- 看 Windows 篇时，重点问：token、ACL、firewall、desktop 为什么要同时存在？
+
+这样你读单平台源码时，就会是在验证机制，而不是在源码目录里迷路。
+
+## 一句话收尾
+
+沙箱机制的横向比较，真正要比的不是“哪个平台文件更多”，而是：
+
+> 每个平台分别用什么办法，去解决文件、权限、网络、身份和兼容这五类问题。
+
+一旦把这个框架抓稳，源码文件只是证据，不再是入口障碍。

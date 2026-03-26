@@ -1,155 +1,156 @@
 # Codex Sandbox 总览
 
-> 说明：本文面向能读一些后端代码、但还没有建立 OS sandbox 心智模型的读者。文中的 Codex 源码链接都固定到 `openai/codex` 的 commit `47a9e2e084e21542821ab65aae91f2bd6bf17c07`，方便你边读边对照。
+> 这篇文章先讲“沙箱到底是在解决什么问题”，再讲 Codex 怎样把同一份策略落到 macOS、Linux 和 Windows。
+> 如果你对进程、系统调用、权限边界、ACL、token、namespace、seccomp 这些词还不熟，建议先读 [Codex Sandbox 技术基础入门](./codex-sandbox-foundations.md)。
+> 如果你还缺少更宽泛的运行时和容器基础，再回头补 [基础预备：从零看懂 Docker、系统知识与 Kubernetes](./runtime-primer-for-reading-source.md)。
 
-先给你一张“源码地图”：
+## 先建立一张通用心智图
 
-| 你要理解的东西 | 最该先看哪份源码 |
-| --- | --- |
-| Codex 用什么语言描述“允许/禁止什么” | [`codex-rs/protocol/src/protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L79-L81) 与 [`SandboxPolicy`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840) |
-| Codex 怎么把 policy 变成真正的子进程启动参数 | [`codex-rs/core/src/spawn.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L19-L124) |
-| macOS 上怎么落地 | [`codex-rs/sandboxing/src/seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L305-L485) |
-| Linux 上怎么落地 | [`codex-rs/linux-sandbox/src/linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L101-L706) |
-| Windows 上怎么落地 | [`codex-rs/core/src/windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L25-L46) 与 [`run_windows_sandbox_setup_and_persist`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L324-L444) |
+先不要把 sandbox 理解成某个操作系统里的单一开关。更准确的理解是：
 
-## 这解决什么问题
+- 沙箱先定义边界，再运行进程。
+- 边界通常同时覆盖文件系统、网络、进程权限、可见命名空间，以及少数平台上的桌面或会话资源。
+- “隔离”从来不是绝对黑白，而是“默认拒绝 + 明确放行哪些路径、哪些端口、哪些身份、哪些继承关系”。
 
-Codex 不是只负责“执行一个命令”，而是要在不同操作系统上，把同一份 sandbox 意图变成真实的系统限制。对新人来说，最容易误会的一点是：sandbox 不是一个单独的开关，而是一组分层的约束，包含文件系统、网络、进程生命周期、权限边界，以及平台特有的实现细节。
+所以跨平台看 sandbox，最重要的不是先背机制名字，而是先问 4 个问题：
 
-你可以把它想成两层问题。第一层是“允许什么”，这属于共享的 policy 语言。第二层是“怎么在 macOS、Linux、Windows 上真正做到”，这属于平台 helper 的工作。前者比较像协议，后者比较像执行器。
+1. 这个进程默认能看到什么？
+2. 它被允许修改什么？
+3. 它能向外连到哪里？
+4. 它是不是拿着比宿主更小的一组权限在运行？
 
-对应源码：先看 [`SandboxPolicy`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840)，再看 [`spawn_child_async`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L50-L124)。
+只要这 4 个问题不丢，你看 macOS 的 Seatbelt、Linux 的 bubblewrap/seccomp、Windows 的 restricted token/ACL/firewall 时，就不会被平台细节带偏。
 
-## 最少背景
+## 沙箱通常分成两层
 
-你不需要先成为操作系统安全专家，只要先记住 4 个词：
+从设计上看，绝大多数沙箱都可以拆成两层：
 
-1. `policy`：一份“允许/禁止什么”的描述，不是执行本身。
-2. `sandbox`：把进程放进受限环境里，让它看见的文件、网络、权限都变少。
-3. `helper`：平台专用的落地代码。Codex 会把共享 policy 交给它，再由它调用系统能力。
-4. `legacy` 与 `direct enforcement`：有些平台会先接受旧式的综合 policy，再拆成文件系统和网络两份；有些时候必须直接用拆分后的 policy 才能正确执行。
+### 第一层：策略层
 
-如果你只想先建立直觉，可以先把 `SandboxPolicy` 理解成“统一的意图层”，把 macOS 的 Seatbelt、Linux 的 bubblewrap / seccomp / Landlock、Windows 的 sandbox setup 理解成“不同平台的执行层”。
+策略层回答“我想要什么边界”。它描述的是意图，不负责直接调用内核或系统 API。
 
-对应源码：[`protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840) 定义 policy 语言，[`linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L275-L340) 展示了“旧式 policy / 拆分 policy”如何一起被接受。
+比如：
 
-## Codex 的整体策略
+- 工作区可以写，但 `.git` 和 `.codex` 之类的元数据目录不能乱写。
+- 绝大多数文件只读。
+- 网络默认关闭，或者只能通过代理走本地回环。
+- 子进程不应该借机重新拿到更高权限。
 
-Codex 的策略可以概括成一句话：先把 sandbox 意图写成跨平台的 policy，再把这个 policy 交给平台专用的 helper 去执行。这样做的好处是，调用方不需要关心底层到底是 Seatbelt、bubblewrap 还是 Windows sandbox，只要知道“我想要什么样的隔离”。
+### 第二层：强制层
 
-更具体一点，Codex 先在协议层定义 `SandboxPolicy`、`FileSystemSandboxPolicy` 和 `NetworkSandboxPolicy`；随后在启动子进程时，由统一的 `spawn` 层补齐环境变量、stdio、进程组和生命周期控制；最后交给 macOS、Linux、Windows 的专用代码去真正限制文件、网络和权限。
+强制层回答“这个平台怎样真的拦住它”。同样的策略，到了不同系统上，落地手段会完全不同：
 
-这也是为什么你在源码里会看到“同一份意图，有时既有 legacy 形式，也有拆分后的 filesystem / network 形式”。它不是重复设计，而是在给不同执行路径提供同一份语义。
+- macOS 更像把规则编译成一份 Seatbelt policy。
+- Linux 更像先搭一个受限运行视图，再补系统调用和网络收口。
+- Windows 更像把身份、文件 ACL、网络出口、桌面会话分层收紧。
 
-对应源码：[`protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840)、[`spawn.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L50-L124)、[`seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L305-L485)、[`linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L101-L706)、[`windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L25-L46)。
+真正难的地方，不是“有没有 policy”，而是“能不能把同一份 policy 翻译成每个平台都成立的限制”。
 
-## 源码调用链
+## Codex 的做法：共享策略，平台执行
 
-可以先把主链路想成这样：
+Codex 的整体思路可以压缩成一句话：
 
-```text
-调用者
-  -> 共享 policy（protocol.rs）
-  -> 子进程启动器（spawn.rs）
-  -> 平台 helper
-       -> macOS: Seatbelt
-       -> Linux: bubblewrap + seccomp，必要时回退到 Landlock
-       -> Windows: sandbox mode 解析 + setup
-  -> 真正的用户命令
-```
+> 先用共享 policy 描述权限意图，再把它交给平台专属执行层去兑现。
 
-更贴近源码的阅读顺序是：
+这件事在阅读源码时可以理解成三段：
 
-1. `protocol.rs` 先定义“什么叫 sandbox”。
-2. `spawn.rs` 再把这些意图变成一个具体的 `Command`。
-3. macOS 路径里，`seatbelt.rs` 把 policy 变成 `sandbox-exec` 的参数。
-4. Linux 路径里，`linux_run_main.rs` 先解析 policy，再决定是 bubblewrap 主路径、seccomp 内层路径，还是 legacy Landlock 路径。
-5. Windows 路径里，`windows_sandbox.rs` 根据配置和 feature 选择 `Elevated`、`RestrictedToken` 或 `Disabled`，并把 setup 结果持久化。
+1. 共享策略层
+   `SandboxPolicy`、`FileSystemSandboxPolicy`、`NetworkSandboxPolicy` 负责表达“允许什么”和“禁止什么”。
+2. 统一启动层
+   `spawn` 负责把环境变量、stdio、进程组、网络禁用标记这些启动细节摆正。
+3. 平台强制层
+   macOS、Linux、Windows 各自把共享策略翻译成操作系统真正能执行的限制。
 
-你如果只想抓住“谁负责什么”，可以这么记：
+这也是为什么你会在 Codex 里同时看到“总策略”和“拆分后的文件系统/网络策略”。前者更像上层接口，后者更适合某些平台直接消费。
 
-- `protocol.rs` 负责说清楚规则。
-- `spawn.rs` 负责把子进程拉起来。
-- `seatbelt.rs`、`linux_run_main.rs`、`windows_sandbox.rs` 负责把规则落到各自平台。
+## 先把 Codex 的几个关键概念对齐
 
-## 关键机制
+### `SandboxPolicy` 不是“沙箱本身”
 
-### `SandboxPolicy` 是共享语言
+它更像一份权限说明书。你可以把它理解成“我要 full access、read only、workspace write，还是我已经身处外部沙箱里”。
 
-`SandboxPolicy` 不是执行器，而是一份共享的“权限语言”。它描述的是执行意图，例如完全放开、只读、工作区可写、或者已经在外部 sandbox 中。`WorkspaceWrite` 还带有 `writable_roots`、`exclude_tmpdir_env_var` 和 `exclude_slash_tmp` 这类细节，说明“可写”也可以很精细，不是非黑即白。
+关键点不是枚举名字，而是它表达了这些常见语义：
 
-对应源码：[`SandboxPolicy`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840)。
+- 有没有全盘读权限
+- 有没有全盘写权限
+- 有没有全网访问权限
+- 工作区写入是不是还带着排除目录
+- `/tmp` 或 `TMPDIR` 这种惯常写入点要不要跟着开放
 
-### `spawn_child_async` 负责把进程启动“摆正”
+换句话说，Codex 不是把“工作区可写”当成一句模糊口号，而是把它拆成了可核查的规则。
 
-`spawn_child_async` 做的不是 sandbox 本身，而是保证子进程以 Codex 期望的方式启动。它会清空环境变量后再写入需要的变量；如果网络 sandbox 关闭，会设置 `CODEX_SANDBOX_NETWORK_DISABLED=1`；如果是 shell tool 场景，会把 `stdin` 设成空、把 `stdout` / `stderr` 改成管道；还会在 Unix 上尽量处理进程组和父进程死亡信号，让子进程不要在父进程退出后继续乱跑。
+### `spawn` 不是沙箱机制，但它很关键
 
-你可以把它理解成“子进程出生前的最后整形步骤”。
+很多新读者会把 `spawn` 误当成“跟 sandbox 无关的普通启动代码”。其实它负责把策略带入一个稳定、可控的子进程环境：
 
-对应源码：[`spawn.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L50-L124)。
+- 网络受限时，会显式写入 `CODEX_SANDBOX_NETWORK_DISABLED=1`
+- shell tool 场景会重定向 stdio，避免命令在后台偷偷等交互输入
+- Unix 上会尽量处理进程组和父进程死亡后的继承行为
 
-### macOS 用 Seatbelt 把 policy 变成文本规则
+它不负责“拦截文件访问”，但它负责确保真正进入平台沙箱之前，进程出生方式已经符合预期。
 
-macOS 路径里最重要的点是：Codex 不是直接“打开一个系统开关”，而是先把文件读写、网络、Unix socket、平台默认值等拼成一段 Seatbelt policy，然后通过 `/usr/bin/sandbox-exec` 执行。你会在源码里看到 `build_seatbelt_access_policy`、`create_seatbelt_command_args_for_policies` 这类函数，它们本质上是在把“允许哪些 root、排除哪些 subpath、哪些 socket 可以连”翻译成 Seatbelt 能理解的参数。
+### 平台层不是“同一招换个名字”
 
-这说明 macOS 路径的核心不是某个神秘 API，而是“policy 字符串生成器 + sandbox-exec”。
+Codex 到平台层以后，不是简单地把一个布尔值传下去，而是做真正的机制翻译：
 
-对应源码：[`seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L305-L485)。
+- macOS：把文件和网络策略翻成 Seatbelt 可执行的文本规则与参数。
+- Linux：把文件系统策略翻成 bubblewrap 视图，把网络和危险 syscall 进一步收口到 seccomp。
+- Windows：先决定 sandbox level，再通过 restricted token、ACL、firewall、private desktop 等组件把边界补齐。
 
-### Linux 路径是“两段式”
+## 三个平台各自擅长的约束方式
 
-Linux 这边最容易读晕，因为它不是单一工具，而是两段式流程。外层先决定是否用 bubblewrap 构建文件系统视图；内层再通过 `--apply-seccomp-then-exec` 在已经 sandbox 化的环境里继续收紧。`run_main` 里还会根据 `use_legacy_landlock`、`allow_network_for_proxy` 和 `no_proc` 等参数，决定是否走 legacy Landlock、是否允许 proxy-only 网络、是否在某些环境里放弃挂载 `/proc`。
+下面这张表适合先抓直觉，不适合当源码导航表：
 
-换句话说，Linux 的重点不是“一个沙箱”，而是“先搭环境，再在里面再收一层”。
+| 平台 | 直觉上的主要手段 | 你可以怎样理解它 |
+| --- | --- | --- |
+| macOS | Seatbelt policy | “把允许/禁止规则写成一份系统可执行的安全脚本” |
+| Linux | mount namespace + bubblewrap + seccomp | “先搭受限世界，再堵危险出口” |
+| Windows | restricted token + ACL + firewall + desktop | “把身份、路径权限、网络和交互环境拆开分别收紧” |
 
-对应源码：[`linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L101-L706)。
+这三种路径没有谁“更像真正的沙箱”，它们只是各自在操作系统文化里最自然的落地方式。
 
-### Windows 路径先做模式选择，再做 setup
+## 读 Codex 时最容易误解的几件事
 
-Windows 这边要先把配置和 feature 解析成一个明确的 sandbox level。`WindowsSandboxLevelExt` 会在 `Elevated`、`RestrictedToken` 和 `Disabled` 之间做映射；`run_windows_sandbox_setup_and_persist` 则负责真正执行 setup，并把最终模式写回配置。对新人来说，这里最重要的不是某一个字段，而是“Windows sandbox 的行为是先选模式，再做一次 setup，最后持久化这个选择”。
+- “sandbox 就是一个统一开关。”
+  不是。真正起作用的是多层限制叠加。
 
-对应源码：[`windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L25-L46) 与 [`run_windows_sandbox_setup_and_persist`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L324-L444)。
+- “read only 就一定完全不能写任何地方。”
+  不是。很多系统都会保留受控写入点，比如工作区、临时目录，或者显式白名单目录。
 
-## 小例子
+- “网络限制就是有网或没网。”
+  不是。真实实现里通常还会区分 loopback、代理、Unix socket、本地绑定等更细颗粒度。
 
-### 例子 1：一份 policy，多个平台理解
+- “平台层只是实现细节，知道 shared policy 就够了。”
+  也不是。共享策略告诉你意图，平台机制决定这个意图最终靠什么被执行和被绕不过去。
 
-假设你看到这样的意图：
+## 推荐阅读顺序
 
-```rust
-SandboxPolicy::ReadOnly {
-    access: /* 省略 */,
-    network_access: false,
-}
-```
+如果你想把这几篇文档串起来读，推荐按这个顺序：
 
-这句代码的重点不是 Rust 语法，而是语义：文件系统尽量只读，网络也不要打开。到了不同平台，这份意图会被翻译成不同的执行方式。macOS 会变成 Seatbelt policy，Linux 会变成 bubblewrap / seccomp / Landlock 的组合，Windows 会先被映射到对应的 sandbox level 再做 setup。
+1. [基础预备：从零看懂 Docker、系统知识与 Kubernetes](./runtime-primer-for-reading-source.md)
+2. 本文：先建立跨平台沙箱心智模型
+3. [Codex Sandbox 机制横向对照](./codex-sandbox-mechanisms.md)
+4. [Codex 在 macOS 上如何使用 Seatbelt](./codex-sandbox-macos.md)
+5. [Codex 的 Linux sandbox 管线](./codex-sandbox-linux.md)
+6. [Codex 原生 Windows 沙箱入门](./codex-sandbox-windows.md)
 
-### 例子 2：shell tool 的子进程为什么不一样
+这样读的好处是：先抓抽象，再看机制，再下钻到单平台，不容易一开始就陷进源码树。
 
-`spawn_child_async` 里如果走 `RedirectForShellTool`，它不会把 `stdin` 留给子进程自由读，而是改成空输入，同时把输出接到管道里。这样做的直觉很简单：shell tool 应该尽量可控、可收集输出、不会偷偷等待用户输入。
+## 用源码做最后一层佐证
 
-### 例子 3：Linux 为什么会重试 `--no-proc`
+如果你想确认上面的说法，这几处源码最值得当“证据链”而不是“阅读入口”：
 
-Linux helper 里有一段很实用的保护：它会先用 bubblewrap 做一个小预检，如果发现当前环境不支持挂载 `/proc`，就会退回到不挂载 `/proc` 的路径。你可以把它理解成“先试一次安全的默认值，失败后退回更保守的兼容路径”。
+- 共享策略定义：[`protocol.rs` 里的 `SandboxPolicy`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L857)
+- 拆分策略定义：[`permissions.rs` 里的 `NetworkSandboxPolicy` 等类型](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/permissions.rs#L25-L177)
+- 统一启动层：[`core/src/spawn.rs` 里的 `spawn_child_async`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L50-L124)
+- macOS 落地：[`sandboxing/src/seatbelt.rs` 里的 `create_seatbelt_command_args_for_policies`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L373-L485)
+- Linux 落地：[`linux_run_main.rs` 里的 `run_main` 与 proc fallback 路径](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L101-L206)
+- Windows 落地：[`windows_sandbox.rs` 里的 level 解析与 setup 持久化](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L25-L46) 和 [`run_windows_sandbox_setup_and_persist`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L310-L444)
 
-对应源码：[`spawn.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L87-L124)、[`linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L401-L706)。
+## 一句话收尾
 
-## 常见误解
+理解 Codex sandbox 的最好方式，不是先问“源码从哪进”，而是先问：
 
-- “sandbox 就是一层统一的系统开关。” 不是。Codex 的 sandbox 是共享 policy 加平台 helper 的组合。
-- “只读就是绝对不能写。” 也不是。`WorkspaceWrite` 允许有写入根目录，还可以排除某些子路径。
-- “Linux 一直靠 Landlock。” 不是。当前主路径更偏向 bubblewrap + seccomp，Landlock 是 legacy fallback。
-- “Windows 的 elevated / unelevated 只是 UI 文案。” 不是。它们会影响 setup 逻辑和最终持久化的模式。
-- “网络策略就是有网或没网。” 也太粗了。源码里还会考虑 proxy、loopback、本地 socket 和路由桥接。
+> 它怎样把一份跨平台权限意图，翻译成每个操作系统都真的拦得住的边界。
 
-对应源码：[`protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840)、[`linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L275-L340)、[`seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L193-L285)、[`windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L63-L75)。
-
-## 下一步怎么读源码
-
-如果你想继续往下读，我建议按这个顺序走：
-
-1. 先读 [`protocol.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/protocol/src/protocol.rs#L787-L840)，把 `SandboxPolicy`、`FileSystemSandboxPolicy`、`NetworkSandboxPolicy` 这三个名字先对齐。
-2. 再读 [`spawn.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/spawn.rs#L50-L124)，看 Codex 如何真正启动子进程。
-3. 选一个平台深入：macOS 看 [`seatbelt.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/sandboxing/src/seatbelt.rs#L305-L485)，Linux 看 [`linux_run_main.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/linux-sandbox/src/linux_run_main.rs#L101-L706)，Windows 看 [`windows_sandbox.rs`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L25-L46) 和 [`run_windows_sandbox_setup_and_persist`](https://github.com/openai/codex/blob/47a9e2e084e21542821ab65aae91f2bd6bf17c07/codex-rs/core/src/windows_sandbox.rs#L324-L444)。
-4. 如果你读到一半开始迷糊，就回到“源码调用链”那一节，重新确认“policy -> spawn -> 平台 helper -> 命令”这条主线。
+只要这句话抓住了，后面的平台文档和源码细节都会更好读。

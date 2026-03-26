@@ -52,6 +52,7 @@ OpenSandbox 已进入 [CNCF Landscape](https://landscape.cncf.io/?item=orchestra
 </div>
 
 ## Codex Sandbox 阅读路线
+- [Codex Sandbox 技术基础入门](./codex-sandbox-foundations)
 - [Codex Sandbox 总览](./codex-sandbox-overview)
 - [Codex sandbox 机制横向对照](./codex-sandbox-mechanisms)
 - [Codex 在 macOS 上如何使用 Seatbelt](./codex-sandbox-macos)
