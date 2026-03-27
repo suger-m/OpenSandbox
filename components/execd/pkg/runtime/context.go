@@ -40,13 +40,23 @@ func (c *Controller) CreateContext(req *CreateContextRequest) (string, error) {
 		err     error
 	)
 
+	// err = retry.OnError(kernelWaitingBackoff, func(err error) bool {
+	// 	log.Error("failed to create session, retrying: %v", err)
+	// 	return err != nil
+	// }, func() error {
+	// 	client, session, err = c.createJupyterContext(*req)
+	// 	return err
+	// })
+
 	err = retry.OnError(kernelWaitingBackoff, func(err error) bool {
 		log.Error("failed to create session, retrying: %v", err)
 		return err != nil
+
 	}, func() error {
 		client, session, err = c.createJupyterContext(*req)
 		return err
 	})
+
 	if err != nil {
 		return "", err
 	}

@@ -51,4 +51,15 @@ OpenSandbox 已进入 [CNCF Landscape](https://landscape.cncf.io/?item=orchestra
   </a>
 </div>
 
+## Codex Sandbox 阅读路线
+- [Codex Sandbox 总览](./codex-sandbox-overview)
+- [Codex sandbox 机制横向对照](./codex-sandbox-mechanisms)
+- [Codex 在 macOS 上如何使用 Seatbelt](./codex-sandbox-macos)
+- [Codex 的 Linux sandbox 管线](./codex-sandbox-linux)
+- [Codex 原生 Windows 沙箱入门](./codex-sandbox-windows)
+
+## 运行时入门
+
+- [从零看懂 Docker、系统知识与 Kubernetes](./runtime-primer-for-reading-source)
+
 更多场景请查看 [示例](./examples/readme)。
